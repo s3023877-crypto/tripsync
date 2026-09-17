@@ -1,0 +1,22 @@
+# Local environment / secrets
+env.js
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test output
+coverage/
+playwright-report/
+test-results/

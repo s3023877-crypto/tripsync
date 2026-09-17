@@ -1,0 +1,13 @@
+{
+  "name": "TripSync",
+  "short_name": "TripSync",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F2F4F7",
+  "theme_color": "#16233A",
+  "description": "Plan trips together with shared decisions, itinerary, checklist and expenses.",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
