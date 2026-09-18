@@ -185,6 +185,7 @@ const ENV = (typeof window !== 'undefined' && window.TRIPSYNC_ENV) || {}
 const CONFIG = {
  url: ENV.url || '',
  anonKey: ENV.anonKey || '',
+ vapidPublicKey: ENV.vapidPublicKey || '',
 }
 
 /* --------------------------------------------------------------------------
@@ -210,6 +211,69 @@ const sb = window.supabase.createClient(
  isConfigured ? CONFIG.anonKey : 'placeholder',
  { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } }
 )
+
+/* --------------------------------------------------------------------------
+  Web Push — registration is optional until the user turns Alerts on.
+  The public VAPID key is safe in the frontend; the private key stays in the
+  Supabase Edge Function.
+  -------------------------------------------------------------------------- */
+function urlBase64ToUint8Array(base64String) {
+ const padding = '='.repeat((4 - base64String.length % 4) % 4)
+ const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
+ const raw = atob(base64)
+ return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)))
+}
+
+async function getPushRegistration() {
+ if (!('serviceWorker' in navigator) || !('PushManager' in window) || !CONFIG.vapidPublicKey) return null
+ const reg = await navigator.serviceWorker.register('./sw.js')
+ await navigator.serviceWorker.ready
+ return reg
+}
+
+async function registerTripSyncPush() {
+ const permission = typeof Notification !== 'undefined'
+   ? await Notification.requestPermission()
+   : 'denied'
+ if (permission !== 'granted') return null
+ const reg = await getPushRegistration()
+ if (!reg) return null
+ let sub = await reg.pushManager.getSubscription()
+ if (!sub) {
+   sub = await reg.pushManager.subscribe({
+     userVisibleOnly: true,
+     applicationServerKey: urlBase64ToUint8Array(CONFIG.vapidPublicKey),
+   })
+ }
+ const json = sub.toJSON()
+ const id = await uid()
+ if (!id || !json.endpoint || !json.keys?.p256dh || !json.keys?.auth) return sub
+ const result = await sb.from('push_subscriptions').upsert({
+   user_id: id,
+   endpoint: json.endpoint,
+   p256dh: json.keys.p256dh,
+   auth: json.keys.auth,
+   user_agent: navigator.userAgent,
+   updated_at: new Date().toISOString(),
+ }, { onConflict: 'user_id,endpoint' })
+ if (result.error) throw new Error(result.error.message)
+ return sub
+}
+
+async function disableTripSyncPush() {
+ if (!('serviceWorker' in navigator)) return
+ const reg = await navigator.serviceWorker.getRegistration('./sw.js') || await navigator.serviceWorker.getRegistration()
+ if (!reg) return
+ const sub = await reg.pushManager.getSubscription()
+ if (!sub) return
+ const endpoint = sub.endpoint
+ const id = await uid()
+ await sub.unsubscribe()
+ if (id && endpoint) {
+   await sb.from('push_subscriptions').delete().eq('user_id', id).eq('endpoint', endpoint)
+ }
+}
+
 
 /* ==========================================================================
   1. Helpers — hooks, formatting, and the money maths
@@ -607,27 +671,6 @@ const api = {
    const { data, error } = await sb.auth.signInWithPassword({ email, password })
    if (error) throw new Error(error.message)
    return data
- },
- async sendPasswordReset(email) {
-   const clean = String(email || '').trim()
-   if (!clean) throw new Error('Enter your email address')
-   const { error } = await sb.auth.resetPasswordForEmail(clean, {
-     redirectTo: window.location.origin + window.location.pathname,
-   })
-   if (error) throw new Error(error.message)
- },
- async updatePassword(password) {
-   const { data, error } = await sb.auth.updateUser({ password })
-   if (error) throw new Error(error.message)
-   return data
- },
- async setPushEnabled(enabled) {
-   const id = await uid()
-   if (!id) return
-   const { error } = await sb.from('push_subscriptions')
-     .update({ push_enabled: Boolean(enabled) })
-     .eq('user_id', id)
-   if (error) throw new Error(error.message)
  },
  signOut: () => sb.auth.signOut(),
 
@@ -1441,7 +1484,6 @@ function IconButton({ label, onClick }) {
 function App() {
  const [session, setSession] = useState(undefined) // undefined while checking
  const [expired, setExpired] = useState(false)
- const [recovering, setRecovering] = useState(() => /(?:^|[&#?])type=recovery(?:&|$)/.test(window.location.hash))
  const route = useHashRoute()
  const online = useOnline()
 
@@ -1450,7 +1492,6 @@ function App() {
    sb.auth.getSession().then(({ data }) => setSession(data.session ?? null))
    const { data } = sb.auth.onAuthStateChange((event, next) => {
      setSession(next)
-     if (event === 'PASSWORD_RECOVERY') setRecovering(true)
      if (next) setExpired(false)
      if (event === 'SIGNED_OUT' || event === 'TOKEN_REFRESHED') setExpired(false)
    })
@@ -1461,7 +1502,6 @@ function App() {
  useEffect(() => appFault.watch((kind) => { if (kind === 'expired') setExpired(true) }), [])
 
  if (!isConfigured) return <SetupNotice />
- if (recovering) return <RecoveryScreen />
  if (session === undefined) return <BootScreen label="Checking your session" />
  if (!session) return <AuthScreen />
 
@@ -1606,7 +1646,7 @@ function ProfileEditor({ email }) {
 }
 
 function AuthScreen() {
- const [mode, setMode] = useState('in') // in | up | forgot
+ const [mode, setMode] = useState('in')
  const [form, setForm] = useState({ email: '', password: '', fullName: '', phone: '' })
  const [state, setState] = useState({ busy: false, error: null, notice: null })
  const [shown, setShown] = useState(false)
@@ -1614,55 +1654,33 @@ function AuthScreen() {
  const set = (key) => (e) => setForm({ ...form, [key]: e.target.value })
  const blur = (key) => () => setTouched({ ...touched, [key]: true })
 
- const problems = mode === 'forgot'
-   ? {
-       email: !form.email.trim()
-         ? 'An email address is needed'
-         : !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(form.email.trim())
-           ? "That doesn't look like an email address"
-           : '',
-     }
-   : {
-       fullName: mode === 'up' && !form.fullName.trim() ? 'Tell the group what to call you' : '',
-       email: !form.email.trim()
-         ? 'An email address is needed'
-         : !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(form.email.trim())
-           ? "That doesn't look like an email address"
-           : '',
-       password: !form.password
-         ? 'A password is needed'
-         : form.password.length < 6
-           ? 'Six characters or more'
-           : '',
-     }
+ // Validation is checked as you leave a field and again on submit, so the
+ // form never just refuses silently.
+ const problems = {
+   fullName: mode === 'up' && !form.fullName.trim() ? 'Tell the group what to call you' : '',
+   email: !form.email.trim()
+     ? 'An email address is needed'
+     : !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(form.email.trim())
+       ? "That doesn't look like an email address"
+       : '',
+   password: !form.password
+     ? 'A password is needed'
+     : form.password.length < 6
+       ? 'Six characters or more'
+       : '',
+ }
  const showProblem = (key) => (touched[key] ? problems[key] : '')
  const blocked = Object.values(problems).some(Boolean)
-
- function switchMode(next) {
-   setMode(next)
-   setState({ busy: false, error: null, notice: null })
-   setTouched({})
-   setShown(false)
- }
 
  async function submit(e) {
    e.preventDefault()
    if (blocked) {
-     setTouched(Object.fromEntries(Object.keys(problems).map((k) => [k, true])))
+     setTouched({ fullName: true, email: true, password: true })
      setState({ busy: false, error: null, notice: null })
      return
    }
    setState({ busy: true, error: null, notice: null })
    try {
-     if (mode === 'forgot') {
-       await api.sendPasswordReset(form.email)
-       setState({
-         busy: false,
-         error: null,
-         notice: 'If an account uses that email, a password reset link has been sent. Check your inbox and spam folder.',
-       })
-       return
-     }
      if (mode === 'in') {
        await api.signIn(form)
      } else {
@@ -1678,20 +1696,20 @@ function AuthScreen() {
    }
  }
 
- const title = mode === 'forgot' ? 'Reset your password' : 'Everyone knows the plan before anyone packs.'
-
  return (
    <div className="flex min-h-screen flex-col">
    <div className="mx-auto grid w-full max-w-app flex-1 items-center gap-10 px-4 py-10 sm:px-6 lg:grid-cols-[1.05fr_minmax(0,380px)] lg:gap-16">
      <div>
        <Logo className="text-[19px]" />
        <h1 className="mt-7 max-w-[19ch] text-[34px] font-bold leading-[1.08] sm:text-5xl">
-         {title}
+         Everyone knows the plan before anyone packs.
        </h1>
        <p className="mt-4 max-w-[54ch] text-[15px] leading-relaxed text-slate-550">
          Build the itinerary together, vote on the calls nobody can make, tick off the shared
          list, and keep the money straight — one code for the whole group.
        </p>
+
+       {/* Hero: the object this product is really about — a shared day plan. */}
        <div className="mt-9 max-w-md">
          <div className="stub overflow-hidden">
            <div className="flex items-baseline justify-between border-b border-line px-4 py-2.5">
@@ -1703,7 +1721,7 @@ function AuthScreen() {
                ['06:40', 'Cab to the airport', 'Mahesh has the booking'],
                ['11:15', 'Check in at Anjuna', 'Two rooms, three nights'],
                ['18:30', 'Sunset at Chapora', 'happening now'],
-             ].map(([time, itemTitle, note], i) => (
+             ].map(([time, title, note], i) => (
                <li key={time} className="flex gap-3 px-4 py-3">
                  <span className="num w-12 shrink-0 pt-0.5 text-[13px] font-medium text-slate-550">{time}</span>
                  <span className="relative flex w-3 shrink-0 justify-center">
@@ -1711,7 +1729,7 @@ function AuthScreen() {
                    <span className={cls('relative mt-1.5 h-2 w-2 rounded-full ring-2 ring-white', i === 2 ? 'bg-signal' : 'bg-ink/25')} />
                  </span>
                  <span className="min-w-0">
-                   <span className="block truncate text-sm font-medium">{itemTitle}</span>
+                   <span className="block truncate text-sm font-medium">{title}</span>
                    <span className={cls('block text-xs', i === 2 ? 'text-signal' : 'text-slate-550')}>{note}</span>
                  </span>
                </li>
@@ -1722,169 +1740,72 @@ function AuthScreen() {
      </div>
 
      <form onSubmit={submit} className="card p-5 sm:p-6">
-       {mode !== 'forgot' && (
-         <div className="flex gap-1 rounded-md bg-paper p-1">
-           {[['in', 'Sign in'], ['up', 'Create account']].map(([key, label]) => (
-             <button key={key} type="button" onClick={() => switchMode(key)}
-               className={cls('h-8 flex-1 rounded text-[13px] font-medium transition-colors',
-                 mode === key ? 'bg-white text-ink shadow-card' : 'text-slate-550')}>{label}</button>
-           ))}
-         </div>
-       )}
+       <div className="flex gap-1 rounded-md bg-paper p-1">
+         {[['in', 'Sign in'], ['up', 'Create account']].map(([key, label]) => (
+           <button key={key} type="button" onClick={() => setMode(key)}
+             className={cls('h-8 flex-1 rounded text-[13px] font-medium transition-colors',
+               mode === key ? 'bg-white text-ink shadow-card' : 'text-slate-550')}>{label}</button>
+         ))}
+       </div>
 
        <div className="mt-5 space-y-3">
-         {mode === 'forgot' ? (
+         {mode === 'up' && (
            <>
              <div>
-               <label className="label" htmlFor="au-reset-email">Email</label>
-               <input id="au-reset-email" type="email" autoComplete="email" inputMode="email"
-                 className={cls('field', showProblem('email') && 'border-alert')}
-                 value={form.email} onChange={set('email')} onBlur={blur('email')}
-                 aria-invalid={Boolean(showProblem('email'))} aria-describedby="au-reset-email-err" />
-               <FieldError id="au-reset-email-err" message={showProblem('email')} />
-             </div>
-             <ErrorNote error={state.error} />
-             {state.notice && (
-               <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">{state.notice}</p>
-             )}
-             <button type="submit" className="btn btn-brand w-full" disabled={state.busy}>
-               {state.busy ? 'Sending reset link' : 'Send reset link'}
-             </button>
-             <button type="button" className="btn btn-quiet w-full" onClick={() => switchMode('in')}>
-               Back to sign in
-             </button>
-           </>
-         ) : (
-           <>
-             {mode === 'up' && (
-               <>
-                 <div>
-                   <label className="label" htmlFor="au-name">Your name</label>
-                   <input id="au-name" className={cls('field', showProblem('fullName') && 'border-alert')}
-                     value={form.fullName} onChange={set('fullName')} onBlur={blur('fullName')}
-                     aria-invalid={Boolean(showProblem('fullName'))} aria-describedby="au-name-err" />
-                   <FieldError id="au-name-err" message={showProblem('fullName')} />
-                 </div>
-                 <div>
-                   <label className="label" htmlFor="au-phone">Phone number (optional)</label>
-                   <input id="au-phone" className="field" inputMode="tel" value={form.phone} onChange={set('phone')} />
-                 </div>
-               </>
-             )}
-             <div>
-               <label className="label" htmlFor="au-email">Email</label>
-               <input id="au-email" type="email" autoComplete="email" inputMode="email"
-                 className={cls('field', showProblem('email') && 'border-alert')}
-                 value={form.email} onChange={set('email')} onBlur={blur('email')}
-                 aria-invalid={Boolean(showProblem('email'))} aria-describedby="au-email-err" />
-               <FieldError id="au-email-err" message={showProblem('email')} />
+               <label className="label" htmlFor="au-name">Your name</label>
+               <input id="au-name" className={cls('field', showProblem('fullName') && 'border-alert')}
+                 value={form.fullName} onChange={set('fullName')} onBlur={blur('fullName')}
+                 aria-invalid={Boolean(showProblem('fullName'))}
+                 aria-describedby="au-name-err" />
+               <FieldError id="au-name-err" message={showProblem('fullName')} />
              </div>
              <div>
-               <label className="label" htmlFor="au-pass">Password</label>
-               <div className="relative">
-                 <input id="au-pass" type={shown ? 'text' : 'password'}
-                   autoComplete={mode === 'in' ? 'current-password' : 'new-password'}
-                   className={cls('field pr-20', showProblem('password') && 'border-alert')}
-                   value={form.password} onChange={set('password')} onBlur={blur('password')}
-                   aria-invalid={Boolean(showProblem('password'))} aria-describedby="au-pass-err" />
-                 <button type="button" onClick={() => setShown((v) => !v)} aria-pressed={shown}
-                   className="absolute right-1 top-1 h-8 rounded px-2.5 text-[12px] font-medium text-slate-550 hover:bg-paper hover:text-ink">
-                   {shown ? 'Hide' : 'Show'}
-                 </button>
-               </div>
-               <FieldError id="au-pass-err" message={showProblem('password')} />
+               <label className="label" htmlFor="au-phone">Phone number (optional)</label>
+               <input id="au-phone" className="field" inputMode="tel" value={form.phone} onChange={set('phone')} />
              </div>
-
-             <ErrorNote error={state.error} />
-             {state.notice && (
-               <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">{state.notice}</p>
-             )}
-             <button type="submit" className="btn btn-brand w-full"
-               disabled={state.busy || (blocked && Object.keys(touched).length > 0)}>
-               {state.busy ? 'One moment' : mode === 'in' ? 'Sign in' : 'Create account'}
-             </button>
-             {mode === 'in' && (
-               <button type="button" className="w-full text-center text-[13px] font-medium text-brand hover:underline"
-                 onClick={() => switchMode('forgot')}>
-                 Forgot password?
-               </button>
-             )}
-             <p className="muted text-center">
-               {mode === 'in' ? 'New here? Create an account to start a trip.' : 'You can join an existing trip with its code.'}
-             </p>
            </>
          )}
+         <div>
+           <label className="label" htmlFor="au-email">Email</label>
+           <input id="au-email" type="email" autoComplete="email" inputMode="email"
+             className={cls('field', showProblem('email') && 'border-alert')}
+             value={form.email} onChange={set('email')} onBlur={blur('email')}
+             aria-invalid={Boolean(showProblem('email'))} aria-describedby="au-email-err" />
+           <FieldError id="au-email-err" message={showProblem('email')} />
+         </div>
+         <div>
+           <label className="label" htmlFor="au-pass">Password</label>
+           <div className="relative">
+             <input id="au-pass" type={shown ? 'text' : 'password'}
+               autoComplete={mode === 'in' ? 'current-password' : 'new-password'}
+               className={cls('field pr-20', showProblem('password') && 'border-alert')}
+               value={form.password} onChange={set('password')} onBlur={blur('password')}
+               aria-invalid={Boolean(showProblem('password'))} aria-describedby="au-pass-err" />
+             <button type="button"
+               onClick={() => setShown((v) => !v)}
+               aria-pressed={shown}
+               className="absolute right-1 top-1 h-8 rounded px-2.5 text-[12px] font-medium text-slate-550 hover:bg-paper hover:text-ink">
+               {shown ? 'Hide' : 'Show'}
+             </button>
+           </div>
+           <FieldError id="au-pass-err" message={showProblem('password')} />
+         </div>
+
+         <ErrorNote error={state.error} />
+         {state.notice && (
+           <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">{state.notice}</p>
+         )}
+         <button type="submit" className="btn btn-brand w-full"
+           disabled={state.busy || (blocked && Object.keys(touched).length > 0)}>
+           {state.busy ? 'One moment' : mode === 'in' ? 'Sign in' : 'Create account'}
+         </button>
+         <p className="muted text-center">
+           {mode === 'in' ? 'New here? Create an account to start a trip.' : 'You can join an existing trip with its code.'}
+         </p>
        </div>
      </form>
    </div>
    <SiteFooter />
-   </div>
- )
-}
-
-function RecoveryScreen() {
- const [password, setPassword] = useState('')
- const [confirm, setConfirm] = useState('')
- const [shown, setShown] = useState(false)
- const [state, setState] = useState({ busy: false, error: null, notice: null })
- const mismatch = confirm && password !== confirm
- const invalid = password.length < 6 || mismatch
-
- async function submit(e) {
-   e.preventDefault()
-   if (password.length < 6) {
-     setState({ busy: false, error: 'Password must be at least 6 characters.', notice: null })
-     return
-   }
-   if (password !== confirm) {
-     setState({ busy: false, error: 'Passwords do not match.', notice: null })
-     return
-   }
-   setState({ busy: true, error: null, notice: null })
-   try {
-     await api.updatePassword(password)
-     setState({ busy: false, error: null, notice: 'Password updated successfully. You can continue to TripSync.' })
-     setTimeout(() => go('/'), 900)
-   } catch (err) {
-     setState({ busy: false, error: err.message, notice: null })
-   }
- }
-
- return (
-   <div className="flex min-h-screen flex-col">
-     <div className="mx-auto flex w-full max-w-md flex-1 items-center px-4 py-10">
-       <form onSubmit={submit} className="card w-full p-5 sm:p-6">
-         <Logo className="text-[19px]" />
-         <h1 className="mt-6 text-2xl font-bold">Create a new password</h1>
-         <p className="muted mt-1.5">Choose a new password for your TripSync account.</p>
-         <div className="mt-5 space-y-3">
-           <div>
-             <label className="label" htmlFor="new-password">New password</label>
-             <div className="relative">
-               <input id="new-password" type={shown ? 'text' : 'password'} autoComplete="new-password"
-                 className="field pr-20" minLength="6" value={password} onChange={(e) => setPassword(e.target.value)} />
-               <button type="button" onClick={() => setShown((v) => !v)}
-                 className="absolute right-1 top-1 h-8 rounded px-2.5 text-[12px] font-medium text-slate-550 hover:bg-paper hover:text-ink">
-                 {shown ? 'Hide' : 'Show'}
-               </button>
-             </div>
-           </div>
-           <div>
-             <label className="label" htmlFor="confirm-password">Confirm password</label>
-             <input id="confirm-password" type={shown ? 'text' : 'password'} autoComplete="new-password"
-               className={cls('field', mismatch && 'border-alert')} value={confirm}
-               onChange={(e) => setConfirm(e.target.value)} />
-             {mismatch && <p className="mt-1 text-[13px] text-alert">Passwords do not match.</p>}
-           </div>
-           <ErrorNote error={state.error} />
-           {state.notice && <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">{state.notice}</p>}
-           <button type="submit" className="btn btn-brand w-full" disabled={state.busy || invalid}>
-             {state.busy ? 'Updating password' : 'Update password'}
-           </button>
-         </div>
-       </form>
-     </div>
-     <SiteFooter />
    </div>
  )
 }
@@ -2221,8 +2142,6 @@ const TAB_AREAS = {
 function TripPage({ tripId, userId }) {
  const [tab, setTab] = useState('plan')
  const [version, setVersion] = useState(0)
- const [alertsOn, setAlertsOn] = useState(() => localStorage.getItem(`tripsync-alerts:${userId}`) !== 'off')
- const [alertBusy, setAlertBusy] = useState(false)
 
  // One realtime channel for the whole trip: any change re-runs the open tab's
  // queries, so every member sees the same board without a refresh.
@@ -2243,10 +2162,11 @@ function TripPage({ tripId, userId }) {
    return areas.some((key) => fresh[key] && (!seen[area] || fresh[key] > seen[area]))
  }
 
- // Foreground browser alerts are controlled by the header toggle.
+ // Alerts for anything new while the app is open. Real push to a closed app
+ // needs a service worker and a push server, which a static file cannot do.
  const alerted = useRef(null)
  useEffect(() => {
-   if (!alertsOn || typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
    const signature = JSON.stringify(fresh)
    if (alerted.current === null) { alerted.current = signature; return }
    if (alerted.current === signature) return
@@ -2259,33 +2179,7 @@ function TripPage({ tripId, userId }) {
        tag: `${tripId}-activity`,
      })
    } catch { /* some browsers only allow this from a service worker */ }
- }, [JSON.stringify(fresh), alertsOn])
-
- async function toggleAlerts() {
-   if (alertBusy) return
-   setAlertBusy(true)
-   try {
-     if (alertsOn) {
-       setAlertsOn(false)
-       localStorage.setItem(`tripsync-alerts:${userId}`, 'off')
-       try { await api.setPushEnabled(false) } catch {}
-       return
-     }
-     if (typeof Notification === 'undefined') throw new Error('This browser does not support notifications')
-     if (Notification.permission === 'denied') throw new Error('Notifications are blocked for this site. Allow them in your browser settings first.')
-     if (Notification.permission !== 'granted') {
-       const permission = await Notification.requestPermission()
-       if (permission !== 'granted') return
-     }
-     setAlertsOn(true)
-     localStorage.setItem(`tripsync-alerts:${userId}`, 'on')
-     try { await api.setPushEnabled(true) } catch {}
-   } catch (err) {
-     window.alert(err.message || String(err))
-   } finally {
-     setAlertBusy(false)
-   }
- }
+ }, [JSON.stringify(fresh)])
 
  // Opening a tab marks that area read.
  useEffect(() => {
@@ -2319,7 +2213,7 @@ function TripPage({ tripId, userId }) {
 
  return (
    <div className="space-y-4">
-     <TripHeader {...ctx} alertsOn={alertsOn} alertBusy={alertBusy} onToggleAlerts={toggleAlerts} />
+     <TripHeader {...ctx} />
 
      <div className="scroll-x -mx-4 border-b border-line px-4 sm:mx-0 sm:px-0">
        <div className="flex min-w-max">
@@ -2347,10 +2241,9 @@ function TripPage({ tripId, userId }) {
  )
 }
 
-function TripHeader({ trip, members, me, alertsOn, alertBusy, onToggleAlerts }) {
+function TripHeader({ trip, members }) {
  const phase = tripPhase(trip)
  const soon = countdown(trip)
- const [linksOpen, setLinksOpen] = useState(false)
  return (
    <header>
      <a href="#/" className="muted hover:text-ink">← All trips</a>
@@ -2361,17 +2254,10 @@ function TripHeader({ trip, members, me, alertsOn, alertBusy, onToggleAlerts }) 
            {[trip.destination, dateRange(trip.start_date, trip.end_date)].filter(Boolean).join(' · ')}
          </p>
        </div>
-       <div className="flex flex-wrap items-center justify-end gap-2">
+       <div className="flex items-center gap-2">
          {phase === 'live' && <span className="chip border-signal/40 bg-signal-wash text-[#8A5B0E]">Happening now</span>}
          {phase === 'upcoming' && soon && <span className="chip chip-on">Starts {soon}</span>}
          {phase === 'past' && <span className="chip">Wrapped up</span>}
-         <button type="button" className="chip" onClick={() => setLinksOpen(true)}>
-           🔗 Links
-         </button>
-         <button type="button" className={cls('chip', alertsOn && 'chip-on')} disabled={alertBusy}
-           onClick={onToggleAlerts} aria-pressed={alertsOn}>
-           {alertsOn ? '🔔 Alerts ON' : '🔕 Alerts OFF'}
-         </button>
          <div className="flex -space-x-1.5">
            {members.slice(0, 6).map((m) => (
              <span key={m.id} className="rounded-full ring-2 ring-paper"><Avatar name={m.name} id={m.id} size="sm" /></span>
@@ -2379,7 +2265,6 @@ function TripHeader({ trip, members, me, alertsOn, alertBusy, onToggleAlerts }) 
          </div>
        </div>
      </div>
-     <SharedLinksSheet open={linksOpen} onClose={() => setLinksOpen(false)} trip={trip} members={members} me={me} />
    </header>
  )
 }
@@ -2588,10 +2473,12 @@ function ItineraryRow({ item, trip, members, me, admin, rsvps, notes, live, onTh
                <span className="muted">{going.length} in</span>
              </span>
            )}
-           <button type="button" className="chip border-brand/30 text-brand-dark"
-             onClick={async () => { await api.completeStop(item.id, true); onChange() }}>
-             ✓ Mark complete
-           </button>
+           {onTheRoad && (
+             <button type="button" className="chip border-brand/30 text-brand-dark"
+               onClick={async () => { await api.completeStop(item.id, true); onChange() }}>
+               ✓ Done
+             </button>
+           )}
            <button type="button" className="ml-auto text-[13px] font-medium text-brand hover:underline"
              onClick={() => setShowNotes((v) => !v)}>
              {notes.length
@@ -3023,6 +2910,7 @@ function BoardTab({ trip, members, me, version }) {
        </div>
      </Panel>
 
+     <SharedLinks trip={trip} members={members} me={me} admin={admin} version={version} />
    </div>
  )
 }
@@ -3287,121 +3175,70 @@ function PostCard({ post, trip, members, me, admin, onChange }) {
 }
 
 /** Shared albums and folders — a link, not an upload. */
-function SharedLinksSheet({ open, onClose, trip, members, me }) {
- const links = useAsync(() => api.links(trip.id), [trip.id, open])
+function SharedLinks({ trip, members, me, admin, version }) {
+ const links = useAsync(() => api.links(trip.id), [trip.id, version])
  const rows = links.data || []
- const [editing, setEditing] = useState(false)
- const [error, setError] = useState(null)
- const [busy, setBusy] = useState(false)
- const [form, setForm] = useState({ title: '', url: '' })
- const admin = isAdmin(members, me)
-
- useEffect(() => {
-   if (!open) return
-   setEditing(false)
-   setError(null)
- }, [open])
-
- function beginAdd() {
-   setForm({ title: '', url: '' })
-   setError(null)
-   setEditing(true)
- }
- function beginEdit(link) {
-   setForm({ title: link.title || '', url: link.url || '' })
-   setError(null)
-   setEditing(true)
- }
- async function save(e) {
-   e.preventDefault()
-   const url = form.url.trim()
-   if (!/^https?:\/\/[^\s]+$/i.test(url)) {
-     setError('Paste the full link, starting with https://')
-     return
-   }
-   setBusy(true); setError(null)
-   try {
-     if (rows[0]) {
-       await api.update('trip_links', rows[0].id, { title: form.title.trim() || 'Shared link', url })
-     } else {
-       await api.insert('trip_links', { trip_id: trip.id, title: form.title.trim() || 'Shared link', url })
-     }
-     await links.reload()
-     setEditing(false)
-   } catch (err) {
-     setError(err.message || String(err))
-   } finally { setBusy(false) }
- }
- async function remove(link) {
-   if (!window.confirm(`Remove “${link.title}” from this trip?`)) return
-   try { await api.remove('trip_links', link.id); links.reload() } catch (err) { setError(err.message || String(err)) }
- }
 
  return (
-   <Sheet open={open} title="Shared link" onClose={onClose}>
-     <div className="space-y-3">
-       {!editing && rows.length > 0 && (
-         <>
-           {rows.slice(0, 3).map((link) => {
-             const svc = serviceFor(link.url)
-             return (
-               <div key={link.id} className="rounded-lg border border-line bg-paper/60 p-3">
-                 <div className="flex items-center gap-3">
-                   <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-line bg-white text-slate-550">
-                     <svc.Mark />
-                   </span>
-                   <div className="min-w-0 flex-1">
-                     <p className="truncate text-sm font-medium">{link.title || 'Shared link'}</p>
-                     <p className="muted truncate">{hostOf(link.url)} · added by {nameOf(members, link.created_by)}</p>
-                   </div>
-                 </div>
-                 <div className="mt-3 flex gap-2">
-                   <a className="btn btn-brand btn-sm flex-1" href={safeUrl(link.url)} target="_blank" rel="noreferrer">Open link ↗</a>
-                   {(link.created_by === me || admin) && (
-                     <>
-                       <button type="button" className="btn btn-ghost btn-sm" onClick={() => beginEdit(link)}>Edit</button>
-                       <button type="button" className="btn btn-ghost btn-sm" onClick={() => remove(link)}>Remove</button>
-                     </>
-                   )}
-                 </div>
-               </div>
-             )
-           })}
-           {rows.length > 3 && <p className="muted">Showing the first 3 shared links.</p>}
-         </>
-       )}
-
-       {!editing && !rows.length && (
-         <Empty title="No shared link yet" hint="Add a Drive, OneDrive, booking, photo album or any other web link for the trip." />
-       )}
-
-       {!editing && (
-         <button type="button" className="btn btn-brand w-full" onClick={rows.length ? () => beginEdit(rows[0]) : beginAdd}>
-           {rows.length ? 'Edit shared link' : '+ Add shared link'}
-         </button>
-       )}
-
-       {editing && (
-         <form onSubmit={save} className="space-y-3">
+   <Panel title="Photos and files"
+     subtitle="Paste a Google Drive, OneDrive, Dropbox, Photos or iCloud link and it's recognised automatically">
+     <div className="mb-4">
+       <AddBlock openLabel="Add a link" cta="Save link">
+         <Fields onSubmit={async (v) => {
+           const url = v.url.trim()
+           if (!/^https?:\/\//i.test(url)) throw new Error('Paste the full link, starting with https://')
+           await api.insert('trip_links', { trip_id: trip.id, title: v.title.trim() || 'Shared folder', url })
+           links.reload()
+         }}>
            <div>
-             <label className="label" htmlFor="shared-link-title">Title</label>
-             <input id="shared-link-title" className="field" maxLength={120} value={form.title}
-               onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Trip photos" />
+             <label className="label" htmlFor="ln-title">What is it</label>
+             <input id="ln-title" name="title" className="field" maxLength={120} placeholder="Day 1 photos — Drive folder" />
            </div>
            <div>
-             <label className="label" htmlFor="shared-link-url">Link</label>
-             <input id="shared-link-url" className="field" type="url" required value={form.url}
-               onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://..." />
+             <label className="label" htmlFor="ln-url">Link</label>
+             <input id="ln-url" name="url" type="url" className="field" required
+               placeholder="https://drive.google.com/drive/folders/…" />
+             <p className="muted mt-1">
+               Set the folder to "anyone with the link can upload" in Drive or OneDrive first,
+               otherwise the group can look but not add.
+             </p>
            </div>
-           <ErrorNote error={error} />
-           <div className="flex gap-2">
-             <button type="submit" className="btn btn-brand flex-1" disabled={busy}>{busy ? 'Saving' : 'Save link'}</button>
-             <button type="button" className="btn btn-ghost" onClick={() => setEditing(false)}>Cancel</button>
-           </div>
-         </form>
-       )}
+         </Fields>
+       </AddBlock>
      </div>
-   </Sheet>
+
+     {!rows.length && (
+       <Empty title="No links yet"
+         hint="Make one shared folder for the trip and paste it here — everyone's photos end up in one place." />
+     )}
+     <ul className="space-y-1.5">
+       {rows.map((l) => {
+         const svc = serviceFor(l.url)
+         return (
+           <li key={l.id} className="flex items-center gap-1">
+             {/* The whole row is the link — title, service and all. */}
+             <a href={safeUrl(l.url)} target="_blank" rel="noreferrer"
+               className="group flex min-w-0 flex-1 items-center gap-3 rounded-md px-2 py-2 transition-colors hover:bg-paper">
+               <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-line bg-white text-slate-550">
+                 <svc.Mark />
+               </span>
+               <span className="min-w-0 flex-1">
+                 <span className="block truncate text-sm font-medium group-hover:underline">{l.title}</span>
+                 <span className="muted block truncate">
+                   {svc.label}{svc.id === 'link' ? ` · ${hostOf(l.url)}` : ''} · added by {nameOf(members, l.created_by)}
+                 </span>
+               </span>
+               <span className="shrink-0 text-slate-550 group-hover:text-ink" aria-hidden="true">↗</span>
+             </a>
+             {(l.created_by === me || admin) && (
+               <IconButton label={`Remove ${l.title}`}
+                 onClick={async () => { await api.remove('trip_links', l.id); links.reload() }} />
+             )}
+           </li>
+         )
+       })}
+     </ul>
+   </Panel>
  )
 }
 
@@ -3717,33 +3554,71 @@ function AlertSettings({ trip }) {
  const [status, setStatus] = useState(
    typeof Notification === 'undefined' ? 'unsupported' : Notification.permission
  )
+ const [pushOn, setPushOn] = useState(false)
+ const [busy, setBusy] = useState(false)
+ const [error, setError] = useState(null)
+
+ useEffect(() => {
+   let alive = true
+   ;(async () => {
+     try {
+       const reg = await navigator.serviceWorker?.getRegistration('./sw.js') || await navigator.serviceWorker?.getRegistration()
+       const sub = reg ? await reg.pushManager.getSubscription() : null
+       if (alive) setPushOn(Boolean(sub))
+     } catch {}
+   })()
+   return () => { alive = false }
+ }, [])
+
+ async function turnOn() {
+   setBusy(true); setError(null)
+   try {
+     const sub = await registerTripSyncPush()
+     if (!sub) throw new Error('Push alerts are not available in this browser or the VAPID public key is missing.')
+     setStatus('granted')
+     setPushOn(true)
+   } catch (e) {
+     setError(e.message || String(e))
+   } finally { setBusy(false) }
+ }
+
+ async function turnOff() {
+   setBusy(true); setError(null)
+   try {
+     await disableTripSyncPush()
+     setPushOn(false)
+   } catch (e) {
+     setError(e.message || String(e))
+   } finally { setBusy(false) }
+ }
 
  return (
-   <Panel title="Alerts" subtitle="For anything new on this trip">
+   <Panel title="Alerts" subtitle="Phone notifications for new trip activity">
      <div className="flex flex-wrap items-center gap-3">
-       {status === 'granted' && <span className="chip chip-on">Alerts on</span>}
-       {status === 'default' && (
-         <button type="button" className="btn btn-ghost btn-sm"
-           onClick={async () => setStatus(await Notification.requestPermission())}>
-           Turn on alerts
+       {pushOn ? (
+         <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={turnOff}>
+           {busy ? 'Turning off…' : 'Turn off alerts'}
+         </button>
+       ) : (
+         <button type="button" className="btn btn-brand btn-sm" disabled={busy || status === 'denied'}
+           onClick={turnOn}>
+           {busy ? 'Turning on…' : 'Turn on alerts'}
          </button>
        )}
+       {pushOn && <span className="chip chip-on">Alerts on</span>}
        {status === 'denied' && <span className="chip">Blocked in your browser</span>}
        {status === 'unsupported' && <span className="chip">Not supported here</span>}
      </div>
+     <ErrorNote error={error} />
      <p className="muted mt-2">
-       {status === 'granted'
-         ? 'You’ll be notified about new notices, questions, polls and expenses while TripSync is open in a tab.'
-         : status === 'denied'
-           ? 'Unblock notifications for this site in your browser settings to get alerts. Every tab still shows a dot when something is new.'
-           : 'Each tab shows a dot when something is new. Turning alerts on also gives you a browser notification while TripSync is open.'}
-     </p>
-     <p className="muted mt-1.5">
-       Waking a closed app needs a push server, which this build deliberately doesn’t have.
+       {pushOn
+         ? 'TripSync can receive push notifications on this device when the push sender is configured.'
+         : 'Turn this on to register this phone for TripSync push notifications.'}
      </p>
    </Panel>
  )
 }
+
 
 const ROLE_LABEL = { admin: 'Admin', member: 'Member', owner: 'Admin' }
 
@@ -3769,6 +3644,7 @@ function CrewTab({ trip, members, me, reloadTrip }) {
        <InviteShare trip={trip} />
      </Panel>
 
+     <AlertSettings trip={trip} />
 
      <Panel title={`Crew · ${members.length}`}
        subtitle={canManage ? 'Admins can do everything on this trip' : 'Everyone on this trip'}>
