@@ -1,4 +1,4 @@
-const CACHE = 'tripsync-shell-v1';
+const CACHE = 'tripsync-shell-v2';
 
 const APP_SHELL = [
   '/',
@@ -34,15 +34,16 @@ self.addEventListener('fetch', event => {
 
   const url = new URL(req.url);
 
-  // Only handle requests from the same website
   if (url.origin !== self.location.origin) return;
 
-  // Never intercept the service worker itself
+  // Don't intercept the service worker itself
   if (url.pathname === '/sw.js') return;
 
   event.respondWith(
     fetch(req)
       .then(response => {
+
+        // Keep the main PWA shell updated in cache
         if (
           response &&
           response.ok &&
