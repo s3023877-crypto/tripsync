@@ -2616,12 +2616,10 @@ function ItineraryRow({ item, trip, members, me, admin, rsvps, notes, live, onTh
                <span className="muted">{going.length} in</span>
              </span>
            )}
-           {onTheRoad && (
-             <button type="button" className="chip border-brand/30 text-brand-dark"
-               onClick={async () => { await api.completeStop(item.id, true); onChange() }}>
-               ✓ Done
-             </button>
-           )}
+           <button type="button" className="chip border-brand/30 text-brand-dark"
+             onClick={async () => { await api.completeStop(item.id, true); onChange() }}>
+             ✓ Mark complete
+           </button>
            <button type="button" className="ml-auto text-[13px] font-medium text-brand hover:underline"
              onClick={() => setShowNotes((v) => !v)}>
              {notes.length
