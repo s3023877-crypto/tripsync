@@ -18,6 +18,7 @@
 <meta name="theme-color" content="#16233A" />
 <title>TripSync — plan the trip together</title>
 <meta name="description" content="One place for your group's itinerary, decisions, checklists and shared expenses." />
+<link rel="manifest" href="/manifest.webmanifest" />
 
 <link id="favicon" rel="icon" type="image/svg+xml"
  href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316233A'/%3E%3Ccircle cx='8' cy='16' r='3.4' fill='%23fff'/%3E%3Cpath d='M13 16h9' stroke='%23fff' stroke-width='2' stroke-dasharray='3 3'/%3E%3Cpath d='M23 11.5 L27.5 16 L23 20.5 Z' fill='%23F2A93B'/%3E%3C/svg%3E" />
@@ -110,13 +111,19 @@
 <script>
  /* Anything that stops the app before React renders gets shown on the page,
     so a blank "Starting TripSync…" never leaves you guessing. */
- window.bootFail = function (heading, detail) {
+ window.bootFail = function (heading) {
    const root = document.getElementById('root')
    if (!root || root.dataset.failed) return
    root.dataset.failed = '1'
    root.innerHTML =
-     '<div id="boot"><strong style="color:#C1443E;display:block;font-size:15px;margin-bottom:6px">' +
-     heading + '</strong><pre>' + (detail || '') + '</pre></div>'
+     '<div id="boot" style="min-height:70vh;display:flex;align-items:center;justify-content:center;max-width:none;padding:24px">' +
+       '<div style="width:100%;max-width:420px;border:1px solid #DFE3EA;border-radius:14px;background:#fff;padding:24px;box-shadow:0 8px 24px rgba(22,35,58,.08);font-family:Inter,system-ui,sans-serif;text-align:center">' +
+         '<div style="width:44px;height:44px;margin:0 auto 14px;border-radius:12px;border:1px solid #DFE3EA;display:grid;place-items:center;color:#C1443E;font-weight:700">!</div>' +
+         '<strong style="display:block;color:#16233A;font-size:18px;margin-bottom:7px">TripSync couldn’t start</strong>' +
+         '<p style="margin:0;color:#5A6478;font-size:13px;line-height:1.6">Please check your connection and try again. If the problem continues, refresh the page.</p>' +
+         '<button onclick="location.reload()" style="margin-top:18px;border:0;border-radius:8px;background:#0E7C7B;color:#fff;padding:10px 16px;font:600 14px Inter,system-ui,sans-serif;cursor:pointer">Try again</button>' +
+       '</div>' +
+     '</div>'
  }
 
  window.addEventListener('error', function (e) {
@@ -124,19 +131,16 @@
      return   // env.js is expected to be missing until you create it
    }
    if (e.target && e.target.tagName === 'SCRIPT') {
-     window.bootFail('Couldn’t load a dependency', e.target.src +
-       '\n\nCheck your internet connection, or whether a network blocks unpkg / jsdelivr.')
+     window.bootFail('dependency')
    } else {
-     window.bootFail('JavaScript error while starting', (e.message || '') +
-       (e.filename ? '\n' + e.filename + ':' + e.lineno : ''))
+     window.bootFail('startup')
    }
  }, true)
 
  // If nothing has rendered after a few seconds, say so.
  setTimeout(function () {
    if (document.getElementById('boot') && !document.getElementById('root').dataset.failed) {
-     window.bootFail('The app didn’t start',
-       'The dependencies loaded but nothing rendered. Open the browser console (F12) — the first red error names the cause.')
+     window.bootFail('timeout')
    }
  }, 6000)
 </script>
@@ -169,7 +173,7 @@
    if (!(window.supabase && window.supabase.createClient))
      missing.push('Supabase — loaded the wrong build, or the CDN is blocked')
    if (missing.length) {
-     window.bootFail('Missing ' + missing.length + ' of 4 dependencies', missing.join('\n'))
+     window.bootFail('dependencies')
      throw new Error('TripSync dependencies missing')
    }
  })()
@@ -273,7 +277,6 @@ async function disableTripSyncPush() {
    await sb.from('push_subscriptions').delete().eq('user_id', id).eq('endpoint', endpoint)
  }
 }
-
 
 /* ==========================================================================
   1. Helpers — hooks, formatting, and the money maths
@@ -604,6 +607,21 @@ function settlementPlan(net) {
 * instead of a raw Postgres string: a denied row, an expired session and a
 * dead connection need three different answers.
 */
+function friendlyErrorByKind(kind) {
+ return FRIENDLY[kind] || 'Something went wrong. Please try again.'
+}
+
+function friendlyError(error, fallback = 'Something went wrong. Please try again.') {
+ const kind = typeof error === 'object' && error?.kind ? error.kind : classify(error)
+ if (FRIENDLY[kind]) return FRIENDLY[kind]
+ const msg = String(error?.message || error || '').trim()
+ if (!msg) return fallback
+ if (/supabase|postgrest|postgres|pgrst|jwt|row-level|permission denied|relation .* does not exist|schema cache|failed to fetch|networkerror|network request failed/i.test(msg)) {
+   return kind === 'offline' ? FRIENDLY.offline : fallback
+ }
+ return msg.length <= 180 ? msg : fallback
+}
+
 function classify(error) {
  const msg = String(error?.message || error || '')
  const code = error?.code || ''
@@ -630,10 +648,16 @@ const appFault = {
  watch(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) },
 }
 
+window.addEventListener('unhandledrejection', (event) => {
+ const error = event.reason || new Error('Something went wrong. Please try again.')
+ const kind = classify(error)
+ appFault.emit(kind, error)
+})
+
 class DataError extends Error {
  constructor(error) {
    const kind = classify(error)
-   super(String(error?.message || error || 'Something went wrong'))
+   super(friendlyErrorByKind(kind))
    this.kind = kind
    this.code = error?.code || ''
  }
@@ -661,10 +685,25 @@ const uid = () => sb.auth.getUser().then(({ data }) => data.user?.id ?? null)
 const api = {
  // ---- auth -------------------------------------------------------------
  async signUp({ email, password, fullName, phone }) {
-   const { data, error } = await sb.auth.signUp({
-     email, password, options: { data: { full_name: fullName, phone } },
+   // Check our server-side auth lookup first so a second registration is
+   // clearly rejected instead of showing the generic confirmation message.
+   const { data: emailExists, error: lookupError } = await sb.rpc('email_exists', {
+     p_email: email.trim(),
    })
-   if (error) throw new Error(error.message)
+   if (lookupError) throw new Error(lookupError.message)
+   if (emailExists === true) {
+     throw new Error('Mail ID already exists. Please sign in instead.')
+   }
+   const { data, error } = await sb.auth.signUp({
+     email: email.trim(), password, options: { data: { full_name: fullName, phone } },
+   })
+   if (error) {
+     const msg = String(error.message || '').toLowerCase()
+     if (msg.includes('already registered') || msg.includes('already exists') || msg.includes('user already registered')) {
+       throw new Error('Mail ID already exists. Please sign in instead.')
+     }
+     throw new Error(error.message)
+   }
    return data
  },
  async signIn({ email, password }) {
@@ -672,7 +711,12 @@ const api = {
    if (error) throw new Error(error.message)
    return data
  },
- signOut: () => sb.auth.signOut(),
+ async resetPassword(email) {
+   const redirectTo = `${window.location.origin}${window.location.pathname}#/reset-password`
+   const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo })
+   if (error) throw new Error(error.message)
+ },
+ signOut: () => run(sb.auth.signOut()),
 
  async myProfile() {
    const id = await uid()
@@ -740,10 +784,36 @@ const api = {
 
  async vote(pollId, optionIndex) {
    const id = await uid()
-   return run(sb.from('poll_votes').upsert(
-     { poll_id: pollId, user_id: id, option_index: optionIndex },
-     { onConflict: 'poll_id,user_id' }
-   ))
+   const { data: poll, error: pollError } = await sb.from('polls')
+     .select('id, allow_multiple, closed')
+     .eq('id', pollId).single()
+   if (pollError) throw pollError
+   if (poll.closed) throw new Error('This poll is closed')
+
+   const { data: mine, error: mineError } = await sb.from('poll_votes')
+     .select('option_index')
+     .eq('poll_id', pollId).eq('user_id', id)
+   if (mineError) throw mineError
+
+   const selected = (mine || []).some(v => Number(v.option_index) === Number(optionIndex))
+
+   if (poll.allow_multiple) {
+     if (selected) {
+       return run(sb.from('poll_votes').delete()
+         .eq('poll_id', pollId).eq('user_id', id).eq('option_index', optionIndex))
+     }
+     return run(sb.from('poll_votes').insert({
+       poll_id: pollId, user_id: id, option_index: optionIndex
+     }))
+   }
+
+   // Single-answer poll: selecting another option replaces the previous answer.
+   const removeOtherAnswers = await sb.from('poll_votes')
+     .delete().eq('poll_id', pollId).eq('user_id', id)
+   if (removeOtherAnswers.error) throw removeOtherAnswers.error
+   return run(sb.from('poll_votes').insert({
+     poll_id: pollId, user_id: id, option_index: optionIndex
+   }))
  },
 
  /** Passing the same answer twice clears it, so an RSVP can be undone. */
@@ -1006,7 +1076,7 @@ function FaultToast() {
  const [fault, setFault] = useState(null)
  useEffect(() => appFault.watch((kind, error) => {
    if (kind === 'expired') return
-   setFault({ kind, text: FRIENDLY[kind] || String(error?.message || 'Something went wrong') })
+   setFault({ kind, text: friendlyError(error) })
  }), [])
  useEffect(() => {
    if (!fault) return
@@ -1046,9 +1116,11 @@ function useOnline() {
 
 function Loading({ label = 'Loading' }) {
  return (
-   <div className="flex items-center gap-2 py-6 text-[13px] text-slate-550">
-     <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />
-     {label}
+   <div className="flex items-center gap-3 py-7 text-[13px] text-slate-550" role="status" aria-live="polite">
+     <span className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-white" aria-hidden="true">
+       <span className="h-2 w-2 animate-pulse rounded-full bg-brand" />
+     </span>
+     <span>{label}</span>
    </div>
  )
 }
@@ -1065,7 +1137,7 @@ const FRIENDLY = {
 function ErrorNote({ error, onRetry }) {
  if (!error) return null
  const kind = typeof error === 'object' ? error.kind : null
- const text = (kind && FRIENDLY[kind]) || String(error?.message || error)
+ const text = friendlyError(error)
  return (
    <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-alert/25 bg-alert-wash px-3 py-2 text-[13px] text-alert"
      role="alert">
@@ -1503,6 +1575,12 @@ function App() {
 
  if (!isConfigured) return <SetupNotice />
  if (session === undefined) return <BootScreen label="Checking your session" />
+ if (!online && !session && route !== '/reset-password') {
+   return <StateScreen kind="offline" title="No internet connection"
+     detail="TripSync needs a connection to sign in and load your trips. Reconnect and try again."
+     action="Try again" onAction={() => location.reload()} />
+ }
+ if (route === '/reset-password') return <ResetPasswordScreen />
  if (!session) return <AuthScreen />
 
  if (expired) {
@@ -1526,7 +1604,7 @@ function App() {
      {!online && (
        <div className="border-b border-signal/40 bg-signal-wash px-4 py-2 text-center text-[13px] text-[#8A5B0E]"
          role="status">
-         You're offline. Nothing will save until the connection is back.
+         You're offline. Changes will save when the connection returns.
        </div>
      )}
      <main className="mx-auto w-full max-w-app px-4 pb-10 pt-5 sm:px-6">
@@ -1650,6 +1728,7 @@ function AuthScreen() {
  const [form, setForm] = useState({ email: '', password: '', fullName: '', phone: '' })
  const [state, setState] = useState({ busy: false, error: null, notice: null })
  const [shown, setShown] = useState(false)
+ const [resetting, setResetting] = useState(false)
  const [touched, setTouched] = useState({})
  const set = (key) => (e) => setForm({ ...form, [key]: e.target.value })
  const blur = (key) => () => setTouched({ ...touched, [key]: true })
@@ -1671,6 +1750,25 @@ function AuthScreen() {
  }
  const showProblem = (key) => (touched[key] ? problems[key] : '')
  const blocked = Object.values(problems).some(Boolean)
+
+ async function forgotPassword() {
+   const email = form.email.trim()
+   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+     setState({ busy: false, error: 'Enter your email address first.', notice: null })
+     setTouched({ ...touched, email: true })
+     return
+   }
+   setResetting(true)
+   setState({ busy: false, error: null, notice: null })
+   try {
+     await api.resetPassword(email)
+     setState({ busy: false, error: null, notice: 'Password reset link sent. Check your email.' })
+   } catch (err) {
+     setState({ busy: false, error: err.message, notice: null })
+   } finally {
+     setResetting(false)
+   }
+ }
 
  async function submit(e) {
    e.preventDefault()
@@ -1791,6 +1889,14 @@ function AuthScreen() {
            <FieldError id="au-pass-err" message={showProblem('password')} />
          </div>
 
+         {mode === 'in' && (
+           <div className="text-right">
+             <button type="button" className="text-[13px] font-medium text-brand hover:underline"
+               onClick={forgotPassword} disabled={resetting}>
+               {resetting ? 'Sending…' : 'Forgot password?'}
+             </button>
+           </div>
+         )}
          <ErrorNote error={state.error} />
          {state.notice && (
            <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">{state.notice}</p>
@@ -1810,26 +1916,59 @@ function AuthScreen() {
  )
 }
 
+function ResetPasswordScreen() {
+ const [password, setPassword] = useState('')
+ const [state, setState] = useState({ busy: false, error: null, done: false })
+
+ async function submit(e) {
+   e.preventDefault()
+   if (password.length < 6) { setState({ busy: false, error: 'Use at least 6 characters.', done: false }); return }
+   setState({ busy: true, error: null, done: false })
+   try {
+     const { error } = await sb.auth.updateUser({ password })
+     if (error) throw error
+     setState({ busy: false, error: null, done: true })
+   } catch (e) {
+     setState({ busy: false, error: e.message || String(e), done: false })
+   }
+ }
+
+ return (
+   <div className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-4 py-10">
+     <Logo className="text-[19px]" />
+     <div className="card mt-6 p-5">
+       <h1 className="text-2xl font-bold">Set a new password</h1>
+       <p className="muted mt-2">Choose a new password for your TripSync account.</p>
+       {state.done ? (
+         <div className="mt-5 space-y-3">
+           <p className="rounded-md border border-brand/25 bg-brand-wash px-3 py-2 text-[13px] text-brand-dark">Password updated successfully.</p>
+           <button type="button" className="btn btn-brand w-full" onClick={() => go('/')}>Continue to TripSync</button>
+         </div>
+       ) : (
+         <form onSubmit={submit} className="mt-5 space-y-3">
+           <input type="password" className="field" minLength="6" required value={password}
+             onChange={(e) => setPassword(e.target.value)} placeholder="New password" autoComplete="new-password" />
+           <ErrorNote error={state.error} />
+           <button type="submit" className="btn btn-brand w-full" disabled={state.busy}>
+             {state.busy ? 'Updating…' : 'Update password'}
+           </button>
+         </form>
+       )}
+     </div>
+   </div>
+ )
+}
+
 function SetupNotice() {
  return (
-   <div className="mx-auto flex min-h-screen max-w-xl flex-col justify-center px-4 py-16">
+   <div className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-4 py-10">
      <Logo className="text-[19px]" />
-     <h1 className="mt-6 text-2xl font-bold">TripSync can't find its Supabase keys</h1>
-     <p className="muted mt-2">
-       It looks for them in <code className="rounded bg-white px-1 py-0.5">window.TRIPSYNC_ENV</code>,
-       which <code className="rounded bg-white px-1 py-0.5">env.js</code> sets. On Netlify that file
-       is generated at deploy time. To run it locally, create env.js beside index.html:
-     </p>
-     <pre className="mt-4 overflow-x-auto rounded-lg border border-line bg-white p-4 text-[13px] leading-relaxed">
-{`window.TRIPSYNC_ENV = {
- url: 'https://your-project.supabase.co',
- anonKey: 'eyJhbGciOi…',
-}`}
-     </pre>
-     <p className="muted mt-3">
-       Both values are in Supabase under Project settings → API. Run database.sql in the SQL
-       Editor first, if you haven't yet.
-     </p>
+     <div className="card mt-6 p-6 text-center">
+       <div className="mx-auto grid h-12 w-12 place-items-center rounded-xl border border-line bg-paper text-lg" aria-hidden="true">↯</div>
+       <h1 className="mt-5 text-2xl font-bold">TripSync isn’t connected yet</h1>
+       <p className="muted mt-2">The app configuration is incomplete. Add the required environment values, then reload this page.</p>
+       <button type="button" className="btn btn-brand mt-5 w-full" onClick={() => location.reload()}>Reload</button>
+     </div>
    </div>
  )
 }
@@ -2287,6 +2426,7 @@ function PlanTab({ trip, members, me, version }) {
  const now = Date.now()
  const onTheRoad = tripPhase(trip) === 'live'
  const defaultDay = trip.start_date || new Date().toISOString().slice(0, 10)
+ const defaultEndDay = trip.end_date || defaultDay
 
  async function addItem(v) {
    if (!v.title?.trim()) throw new Error('Give the stop a name')
@@ -2316,11 +2456,13 @@ function PlanTab({ trip, members, me, version }) {
              <div className="grid gap-3 sm:grid-cols-2">
                <div>
                  <label className="label" htmlFor="it-start">Starts</label>
-                 <input id="it-start" name="start_time" type="datetime-local" className="field" required defaultValue={`${defaultDay}T09:00`} />
+                 <input id="it-start" name="start_time" type="datetime-local" className="field" required
+                   min={`${defaultDay}T00:00`} max={`${defaultEndDay}T23:59`} defaultValue={`${defaultDay}T09:00`} />
                </div>
                <div>
                  <label className="label" htmlFor="it-end">Ends (optional)</label>
-                 <input id="it-end" name="end_time" type="datetime-local" className="field" />
+                 <input id="it-end" name="end_time" type="datetime-local" className="field"
+                   min={`${defaultDay}T00:00`} max={`${defaultEndDay}T23:59`} />
                </div>
              </div>
              <div className="grid gap-3 sm:grid-cols-[1fr_140px]">
@@ -2487,7 +2629,7 @@ function ItineraryRow({ item, trip, members, me, admin, rsvps, notes, live, onTh
            </button>
          </div>
 
-         <EditStopSheet open={editing} item={item} onClose={() => setEditing(false)}
+         <EditStopSheet open={editing} item={item} trip={trip} onClose={() => setEditing(false)}
            onDone={() => { setEditing(false); onChange() }} />
 
          {showNotes && (
@@ -2524,7 +2666,7 @@ function localInput(value) {
 * Editing a stop is how an accepted suggestion actually takes effect: the
 * author (or an organiser) changes the details the group agreed on.
 */
-function EditStopSheet({ open, item, onClose, onDone }) {
+function EditStopSheet({ open, item, trip, onClose, onDone }) {
  const [form, setForm] = useState(null)
  const [state, setState] = useState({ busy: false, error: null })
 
@@ -2552,6 +2694,12 @@ function EditStopSheet({ open, item, onClose, onDone }) {
            setState({ busy: true, error: null })
            try {
              if (!form.start_time) throw new Error('A stop needs a start time')
+             const startDay = localDay(form.start_time)
+             const endDay = form.end_time ? localDay(form.end_time) : startDay
+             if (trip.start_date && startDay < trip.start_date) throw new Error('The stop must be on or after the trip start date')
+             if (trip.end_date && startDay > trip.end_date) throw new Error('The stop must be on or before the trip end date')
+             if (trip.end_date && endDay > trip.end_date) throw new Error('The stop end date must be within the trip dates')
+             if (form.end_time && new Date(form.end_time) < new Date(form.start_time)) throw new Error('End time cannot be before start time')
              await api.update('itinerary_items', item.id, {
                title: form.title,
                description: form.description,
@@ -2573,11 +2721,15 @@ function EditStopSheet({ open, item, onClose, onDone }) {
            <div>
              <label className="label" htmlFor="ed-start">Starts</label>
              <input id="ed-start" type="datetime-local" className="field" required
+               min={trip?.start_date ? `${trip.start_date}T00:00` : undefined}
+               max={trip?.end_date ? `${trip.end_date}T23:59` : undefined}
                value={form.start_time} onChange={set('start_time')} />
            </div>
            <div>
              <label className="label" htmlFor="ed-end">Ends (optional)</label>
              <input id="ed-end" type="datetime-local" className="field"
+               min={trip?.start_date ? `${trip.start_date}T00:00` : undefined}
+               max={trip?.end_date ? `${trip.end_date}T23:59` : undefined}
                value={form.end_time} onChange={set('end_time')} />
            </div>
          </div>
@@ -2738,34 +2890,25 @@ function PollsTab({ trip, members, me, version }) {
  return (
    <Panel title="Decisions" subtitle="Put it to the group instead of the group chat">
      <div className="mb-4">
-       <AddBlock openLabel="Start a poll" cta="Post poll">
+       <AddBlock openLabel="Start a poll" cta="Create poll">
          <Fields onSubmit={async (v) => {
-           const options = v.options.split('\n').map((s) => s.trim()).filter(Boolean)
+           const options = (v.options || '').split('\n').map((s) => s.trim()).filter(Boolean)
            if (!v.question?.trim()) throw new Error('Type the question first')
-           if (options.length < 2) throw new Error('Give at least two options, one per line')
+           if (options.length < 2) throw new Error('Add at least two options')
            if (options.length > 20) throw new Error('Twenty options is the most a poll can hold')
+           if (new Set(options.map((x) => x.toLowerCase())).size !== options.length) {
+             throw new Error('Each option must be different')
+           }
            await api.insert('polls', {
-             trip_id: trip.id, question: v.question, options,
+             trip_id: trip.id,
+             question: v.question.trim(),
+             options,
+             allow_multiple: v.allow_multiple === 'on',
              show_voters: v.show_voters === 'on',
            })
            polls.reload()
          }}>
-           <div>
-             <label className="label" htmlFor="pl-q">Question</label>
-             <input id="pl-q" name="question" className="field" required maxLength={300} placeholder="Where do we eat on Friday?" />
-           </div>
-           <div>
-             <label className="label" htmlFor="pl-o">Options, one per line</label>
-             <textarea id="pl-o" name="options" className="field" required defaultValue={'Beach shack\nThali place in town'} />
-           </div>
-           <label className="flex items-start gap-2 text-sm">
-             <input type="checkbox" name="show_voters" defaultChecked
-               className="mt-0.5 h-4 w-4 rounded border-line text-brand focus:ring-brand" />
-             <span>
-               Show who voted for what
-               <span className="muted block">Untick to keep votes anonymous — only the counts show.</span>
-             </span>
-           </label>
+           <PollCreateFields />
          </Fields>
        </AddBlock>
      </div>
@@ -2779,8 +2922,9 @@ function PollsTab({ trip, members, me, version }) {
      <div className="space-y-3">
        {rows.map((poll) => {
          const votes = poll.poll_votes || []
-         const mine = votes.find((v) => v.user_id === me)?.option_index
-         const leader = Math.max(0, ...poll.options.map((_, i) => votes.filter((v) => v.option_index === i).length))
+         const myVotes = new Set(votes.filter((v) => v.user_id === me).map((v) => Number(v.option_index)))
+         const counts = poll.options.map((_, i) => votes.filter((v) => Number(v.option_index) === i).length)
+         const leader = Math.max(0, ...counts)
          return (
            <article key={poll.id} className="stub p-3 sm:p-4">
              <div className="flex items-start justify-between gap-2">
@@ -2800,63 +2944,129 @@ function PollsTab({ trip, members, me, version }) {
                )}
              </div>
              <p className="muted mt-0.5">
-               {votes.length} of {members.length} voted{poll.closed ? ' · closed' : ''}
+               {new Set(votes.map((v) => v.user_id)).size} of {members.length} voted
+               {poll.allow_multiple ? ' · multiple answers allowed' : ' · one answer'}
+               {poll.closed ? ' · closed' : ''}
                {poll.show_voters ? '' : ' · anonymous'}
-               {votes.length < members.length && !poll.closed
-                 ? ` · waiting on ${members.length - votes.length}`
-                 : ''}
              </p>
 
-             {votes.length > 0 && (
-               <p className="muted mt-1">
-                 Leading option has {Math.round((leader / Math.max(1, members.length)) * 100)}% of the group behind it
-                 {leader > members.length / 2 ? ' — a clear majority' : ' — not yet a majority'}.
-               </p>
-             )}
-             <ul className="mt-3 space-y-1.5">
+             <div className="mt-3 rounded-xl border border-line bg-white overflow-hidden">
                {poll.options.map((option, index) => {
-                 const count = votes.filter((v) => v.option_index === index).length
-                 // Share of everyone on the trip, so a single vote out of six
-                 // reads as 17% rather than a misleading 100%.
+                 const count = counts[index]
                  const pct = Math.round((count / Math.max(1, members.length)) * 100)
+                 const selected = myVotes.has(index)
                  const winning = count > 0 && count === leader
                  return (
-                   <li key={index}>
-                     <button type="button" disabled={poll.closed}
-                       onClick={async () => { await api.vote(poll.id, index); polls.reload() }}
-                       className={cls('relative block w-full overflow-hidden rounded-md border px-3 py-2 text-left transition-colors',
-                         mine === index ? 'border-brand/50' : 'border-line',
-                         poll.closed ? 'cursor-default' : 'hover:border-ink/30')}>
-                       <span className={cls('absolute inset-y-0 left-0 transition-[width]', winning ? 'bg-signal-wash' : 'bg-paper')} style={{ width: `${pct}%` }} />
-                       <span className="relative flex items-center justify-between gap-3">
-                         <span className="min-w-0 text-sm font-medium">
-                           {option}{mine === index && <span className="text-brand"> · your vote</span>}
-                           {poll.show_voters && count > 0 && (
-                             <span className="muted mt-0.5 block truncate font-normal">
-                               {votes.filter((v) => v.option_index === index)
-                                 .map((v) => nameOf(members, v.user_id)).join(', ')}
-                             </span>
-                           )}
-                         </span>
-                         <span className="shrink-0 text-right">
-                           <span className={cls('num block text-[13px] font-medium', winning ? 'text-ink' : 'text-slate-550')}>
-                             {pct}%
-                           </span>
-                           <span className="num block text-[11px] text-slate-550">
-                             {count} {count === 1 ? 'vote' : 'votes'}
-                           </span>
-                         </span>
+                   <button key={index} type="button" disabled={poll.closed}
+                     onClick={async () => { await api.vote(poll.id, index); polls.reload() }}
+                     className={cls('relative block w-full border-b border-line px-3 py-2.5 text-left last:border-b-0',
+                       poll.closed ? 'cursor-default' : 'hover:bg-paper/50')}>
+                     <span className="flex items-center gap-3">
+                       <span className={cls('flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2',
+                         selected ? 'border-brand bg-brand text-white' : 'border-slate-300 bg-white')}>
+                         {selected && <span className="text-[11px] leading-none">✓</span>}
                        </span>
-                     </button>
-                   </li>
+                       <span className="min-w-0 flex-1 text-[15px] font-medium">{option}</span>
+                       <span className={cls('num shrink-0 text-[13px] font-medium', winning ? 'text-ink' : 'text-slate-550')}>
+                         {count}
+                       </span>
+                     </span>
+                     <span className="mt-2 ml-8 block h-1.5 overflow-hidden rounded-full bg-paper">
+                       <span className={cls('block h-full rounded-full transition-[width]', winning ? 'bg-brand' : 'bg-slate-300')}
+                         style={{ width: `${pct}%` }} />
+                     </span>
+                     {poll.show_voters && count > 0 && (
+                       <span className="muted mt-1 ml-8 block truncate text-[11px]">
+                         {votes.filter((v) => Number(v.option_index) === index)
+                           .map((v) => nameOf(members, v.user_id)).join(', ')}
+                       </span>
+                     )}
+                   </button>
                  )
                })}
-             </ul>
+             </div>
+             {poll.allow_multiple && !poll.closed && (
+               <p className="muted mt-1.5 text-[12px]">Select one or more options.</p>
+             )}
            </article>
          )
        })}
      </div>
    </Panel>
+ )
+}
+
+function PollCreateFields() {
+ const [options, setOptions] = useState(['', ''])
+ const [multiple, setMultiple] = useState(false)
+ const [showVoters, setShowVoters] = useState(true)
+
+ // AddBlock/FormData reads named inputs, so keep a newline mirror in the form.
+ const optionText = options.join('\n')
+ const updateOption = (index, value) => {
+   setOptions((current) => current.map((item, i) => i === index ? value : item))
+ }
+ const addOption = () => {
+   if (options.length < 20) setOptions((current) => [...current, ''])
+ }
+ const removeOption = (index) => {
+   if (options.length <= 2) return
+   setOptions((current) => current.filter((_, i) => i !== index))
+ }
+
+ return (
+   <div className="space-y-3">
+     <div>
+       <label className="label" htmlFor="pl-q">Question</label>
+       <input id="pl-q" name="question" className="field" required maxLength={300}
+         placeholder="Where should we go this year?" />
+     </div>
+
+     <div>
+       <label className="label">Options</label>
+       <input type="hidden" name="options" value={optionText} />
+       <div className="space-y-0 rounded-lg border border-line bg-white overflow-hidden">
+         {options.map((option, index) => (
+           <div key={index} className="flex items-center border-b border-line last:border-b-0 px-3">
+             <input
+               className="min-w-0 flex-1 border-0 bg-transparent py-2.5 text-[15px] outline-none focus:ring-0"
+               value={option}
+               onChange={(e) => updateOption(index, e.target.value)}
+               placeholder={`Option ${index + 1}`}
+               maxLength={120}
+             />
+             {options.length > 2 && (
+               <button type="button" className="chip ml-2" onClick={() => removeOption(index)} aria-label={`Remove option ${index + 1}`}>
+                 Remove
+               </button>
+             )}
+             <span className="ml-2 select-none text-slate-400" aria-hidden="true">⋮</span>
+           </div>
+         ))}
+       </div>
+       {options.length < 20 && (
+         <button type="button" className="btn btn-quiet btn-sm mt-2" onClick={addOption}>+ Add</button>
+       )}
+     </div>
+
+     <label className="flex items-start gap-2 text-sm">
+       <input type="checkbox" name="allow_multiple" checked={multiple} onChange={(e) => setMultiple(e.target.checked)}
+         className="mt-0.5 h-4 w-4 rounded border-line text-brand focus:ring-brand" />
+       <span>
+         Allow multiple answers
+         <span className="muted block">Turn off to let each person choose only one option.</span>
+       </span>
+     </label>
+
+     <label className="flex items-start gap-2 text-sm">
+       <input type="checkbox" name="show_voters" checked={showVoters} onChange={(e) => setShowVoters(e.target.checked)}
+         className="mt-0.5 h-4 w-4 rounded border-line text-brand focus:ring-brand" />
+       <span>
+         Show who voted for what
+         <span className="muted block">Turn off to show only vote counts.</span>
+       </span>
+     </label>
+   </div>
  )
 }
 
@@ -2910,7 +3120,17 @@ function BoardTab({ trip, members, me, version }) {
        </div>
      </Panel>
 
-     <SharedLinks trip={trip} members={members} me={me} admin={admin} version={version} />
+     <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-white px-3 py-2 shadow-card">
+       <div className="min-w-0">
+         <p className="text-[13px] font-semibold">Choices & links</p>
+         <p className="muted truncate">Shared trip links, photos and files</p>
+       </div>
+       <button type="button" className="btn btn-ghost btn-sm shrink-0" onClick={() => document.getElementById('links')?.scrollIntoView({ behavior: 'smooth' })}>Open</button>
+     </div>
+
+     <div id="links">
+       <SharedLinks trip={trip} members={members} me={me} admin={admin} version={version} />
+     </div>
    </div>
  )
 }
@@ -2934,7 +3154,7 @@ function Composer({ trip, members, onDone }) {
      await api.post({
        tripId: trip.id,
        kind,
-       title: kind === 'notice' ? form.title : '',
+       title: '',
        body: form.body.trim(),
        state: kind === 'notice' ? form.state : 'ok',
        pinned: kind === 'notice' && form.pinned,
@@ -2959,14 +3179,6 @@ function Composer({ trip, members, onDone }) {
          </button>
        ))}
      </div>
-
-     {kind === 'notice' && (
-       <div className="mb-2">
-         <label className="label" htmlFor="bd-title">Headline (optional)</label>
-         <input id="bd-title" className="field" maxLength={200} placeholder="Cab leaves at 6.40 sharp"
-           value={form.title} onChange={set('title')} />
-       </div>
-     )}
 
      <div>
        <label className="label" htmlFor="bd-body">
@@ -3957,7 +4169,7 @@ function AddExpenseSheet({ open, trip, members, me, onClose, onDone }) {
  const ids = members.map((m) => m.id)
  const [form, setForm] = useState({
    description: '', amount: '', category: 'Food', paidBy: me,
-   spentOn: new Date().toISOString().slice(0, 10),
+   spentOn: trip.start_date || new Date().toISOString().slice(0, 10),
  })
  const [included, setIncluded] = useState(ids)
  const [custom, setCustom] = useState(null) // null = split equally
@@ -3987,6 +4199,8 @@ function AddExpenseSheet({ open, trip, members, me, onClose, onDone }) {
    try {
      if (!included.length) throw new Error('Pick at least one person to split with')
      if (amount <= 0) throw new Error('Enter an amount above zero')
+     if (trip.start_date && form.spentOn < trip.start_date) throw new Error('Expense date must be within the trip dates')
+     if (trip.end_date && form.spentOn > trip.end_date) throw new Error('Expense date must be within the trip dates')
      if (Math.abs(off) > 0.05) throw new Error(`Shares are off by ${money(off, trip.currency)}`)
      await api.addExpense({
        tripId: trip.id, description: form.description, amount, category: form.category,
@@ -4030,7 +4244,9 @@ function AddExpenseSheet({ open, trip, members, me, onClose, onDone }) {
          </div>
          <div>
            <label className="label" htmlFor="ex-date">When</label>
-           <input id="ex-date" type="date" className="field" value={form.spentOn} onChange={set('spentOn')} />
+           <input id="ex-date" type="date" className="field"
+             min={trip.start_date || undefined} max={trip.end_date || undefined}
+             value={form.spentOn} onChange={set('spentOn')} />
          </div>
        </div>
 
@@ -4090,20 +4306,40 @@ function BudgetPlanner({ trip, expenses, me, myBudget, lines, onChange, onBudget
  const plannedTotal = sum(CATEGORIES, (c) => planned[c] || 0)
  const groupTotal = sum(expenses, (e) => e.amount)
  const cap = Number(myBudget) || 0
+ const [budgetDraft, setBudgetDraft] = useState(String(cap || ''))
+ const [budgetBusy, setBudgetBusy] = useState(false)
+ const [budgetError, setBudgetError] = useState(null)
+
+ useEffect(() => { setBudgetDraft(String(cap || '')) }, [cap])
+
+ async function confirmBudget() {
+   const next = Number(budgetDraft) || 0
+   if (next < 0) { setBudgetError('Budget cannot be negative'); return }
+   if (plannedTotal > next + 0.009) {
+     setBudgetError(`Your category allocations total ${money(plannedTotal, trip.currency)}. Reduce them to ${money(next, trip.currency)} or increase your personal budget.`)
+     return
+   }
+   setBudgetBusy(true); setBudgetError(null)
+   try {
+     await api.setMyBudget(trip.id, next)
+     onBudgetChange()
+   } catch (e) { setBudgetError(e.message || String(e)) }
+   finally { setBudgetBusy(false) }
+ }
 
  return (
    <Panel title="Your budget" subtitle="Yours alone — everyone on the trip sets their own">
      <div className="mb-4 flex flex-wrap items-end justify-between gap-3 rounded-lg border border-line bg-paper/70 p-3">
        <div>
          <label className="label" htmlFor="bg-cap">What you plan to spend in total</label>
-         <input id="bg-cap" type="number" min="0" step="500" defaultValue={cap || ''} placeholder="12000"
-           className="field num w-40"
-           onBlur={async (e) => {
-             const next = Number(e.target.value) || 0
-             if (next === cap) return
-             await api.setMyBudget(trip.id, next)
-             onBudgetChange()
-           }} />
+         <div className="flex items-center gap-2">
+           <input id="bg-cap" type="number" min="0" step="100" value={budgetDraft} placeholder="12000"
+             className="field num w-40" onChange={(e) => setBudgetDraft(e.target.value)} />
+           <button type="button" className="btn btn-brand btn-sm" disabled={budgetBusy} onClick={confirmBudget}>
+             {budgetBusy ? 'Saving…' : 'Confirm'}
+           </button>
+         </div>
+         {budgetError && <p className="mt-2 text-[13px] text-alert">{budgetError}</p>}
        </div>
        <p className="muted max-w-[22ch]">Saves when you click away. Nobody else can change your figure.</p>
      </div>
@@ -4155,6 +4391,17 @@ function BudgetPlanner({ trip, expenses, me, myBudget, lines, onChange, onBudget
                    aria-label={`Your planned budget for ${category}`} className="field num h-8 w-24 text-right"
                    onBlur={async (e) => {
                      const next = Number(e.target.value) || 0
+                     const proposedTotal = plannedTotal - plan + next
+                     if (cap > 0 && proposedTotal > cap + 0.009) {
+                       e.target.value = plan || ''
+                       window.alert(`Category allocations cannot exceed your personal budget of ${money(cap, trip.currency)}.`)
+                       return
+                     }
+                     if (cap === 0 && proposedTotal > 0) {
+                       e.target.value = plan || ''
+                       window.alert('Set and confirm your personal budget first.')
+                       return
+                     }
                      if (next === plan) return
                      await api.saveBudgetLine(trip.id, category, next)
                      onChange()
@@ -4224,14 +4471,18 @@ function SettleUp({ trip, members, me, net, history, onChange }) {
                <span className="font-medium">{nameOf(members, t.to)}</span>
              </span>
              <span className="num text-sm font-semibold">{money(t.amount, currency)}</span>
-             <button type="button" className="btn btn-ghost btn-sm"
-               onClick={async () => {
-                 await api.insert('settlements', {
-                   trip_id: trip.id, from_user: t.from, to_user: t.to,
-                   amount: t.amount, note: 'Marked paid in TripSync',
-                 })
-                 onChange()
-               }}>Mark paid</button>
+             {t.to === me ? (
+               <button type="button" className="btn btn-ghost btn-sm"
+                 onClick={async () => {
+                   await api.insert('settlements', {
+                     trip_id: trip.id, from_user: t.from, to_user: t.to,
+                     amount: t.amount, note: 'Marked settled in TripSync',
+                   })
+                   onChange()
+                 }}>Amount settled</button>
+             ) : (
+               <span className="chip">Waiting for {nameOf(members, t.to)}</span>
+             )}
            </li>
          ))}
        </ul>
@@ -4368,7 +4619,7 @@ try {
  mount.innerHTML = '' // clear the "Starting TripSync…" placeholder
  ReactDOM.createRoot(mount).render(<App />)
 } catch (err) {
- window.bootFail('TripSync failed to render', err && (err.stack || err.message))
+ window.bootFail('render')
 }
 </script>
 
