@@ -2398,7 +2398,7 @@ function TripHeader({ trip, members }) {
          {phase === 'upcoming' && soon && <span className="chip chip-on">Starts {soon}</span>}
          {phase === 'past' && <span className="chip">Wrapped up</span>}
          <AlertSettings trip={trip} compact />
-         <div className="flex -space-x-1.5">
+         <div className="ml-3 flex -space-x-1.5">
            {members.slice(0, 6).map((m) => (
              <span key={m.id} className="rounded-full ring-2 ring-paper"><Avatar name={m.name} id={m.id} size="sm" /></span>
            ))}
