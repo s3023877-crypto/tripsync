@@ -2270,7 +2270,7 @@ const TAB_LABEL = Object.fromEntries(TABS)
 // Which activity keys count as news for each tab.
 const TAB_AREAS = {
  plan: ['plan', 'plan_notes'],
- board: ['board', 'board_replies', 'links'],
+ board: ['board', 'board_replies'],
  polls: ['polls'],
  list: ['list'],
  money: ['money'],
@@ -3139,17 +3139,6 @@ function BoardTab({ trip, members, me, version }) {
        </div>
      </Panel>
 
-     <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-white px-3 py-2 shadow-card">
-       <div className="min-w-0">
-         <p className="text-[13px] font-semibold">Choices & links</p>
-         <p className="muted truncate">Shared trip links, photos and files</p>
-       </div>
-       <button type="button" className="btn btn-ghost btn-sm shrink-0" onClick={() => document.getElementById('links')?.scrollIntoView({ behavior: 'smooth' })}>Open</button>
-     </div>
-
-     <div id="links">
-       <SharedLinks trip={trip} members={members} me={me} admin={admin} version={version} />
-     </div>
    </div>
  )
 }
@@ -3406,13 +3395,13 @@ function PostCard({ post, trip, members, me, admin, onChange }) {
 }
 
 /** Shared albums and folders — a link, not an upload. */
-function SharedLinks({ trip, members, me, admin, version }) {
+function SharedLinks({ trip, members, me, admin, version = 0, onChange }) {
  const links = useAsync(() => api.links(trip.id), [trip.id, version])
  const rows = links.data || []
 
  return (
-   <Panel title="Photos and files"
-     subtitle="Paste a Google Drive, OneDrive, Dropbox, Photos or iCloud link and it's recognised automatically">
+   <Panel title="Shared links & files"
+     subtitle="Keep the trip's shared folders, photos and useful links in one place">
      <div className="mb-4">
        <AddBlock openLabel="Add a link" cta="Save link">
          <Fields onSubmit={async (v) => {
@@ -3420,6 +3409,7 @@ function SharedLinks({ trip, members, me, admin, version }) {
            if (!/^https?:\/\//i.test(url)) throw new Error('Paste the full link, starting with https://')
            await api.insert('trip_links', { trip_id: trip.id, title: v.title.trim() || 'Shared folder', url })
            links.reload()
+           onChange?.()
          }}>
            <div>
              <label className="label" htmlFor="ln-title">What is it</label>
@@ -3463,7 +3453,7 @@ function SharedLinks({ trip, members, me, admin, version }) {
              </a>
              {(l.created_by === me || admin) && (
                <IconButton label={`Remove ${l.title}`}
-                 onClick={async () => { await api.remove('trip_links', l.id); links.reload() }} />
+                 onClick={async () => { await api.remove('trip_links', l.id); links.reload(); onChange?.() }} />
              )}
            </li>
          )
@@ -3891,6 +3881,7 @@ const ROLE_LABEL = { admin: 'Admin', member: 'Member', owner: 'Admin' }
 function CrewTab({ trip, members, me, reloadTrip }) {
  const [settings, setSettings] = useState(null)
  const [roleError, setRoleError] = useState(null)
+ const [linksVersion, setLinksVersion] = useState(0)
  // One role does everything. trips.created_by only records who started it.
  const canManage = isAdmin(members, me)
 
@@ -4011,6 +4002,9 @@ function CrewTab({ trip, members, me, reloadTrip }) {
          </p>
        )}
      </Panel>
+
+     <SharedLinks trip={trip} members={members} me={me} admin={canManage} version={linksVersion}
+       onChange={() => setLinksVersion((v) => v + 1)} />
 
      <Sheet open={Boolean(settings)} title="Trip settings" onClose={() => setSettings(null)}>
        {settings && (
