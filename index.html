@@ -2616,11 +2616,16 @@ function ItineraryRow({ item, trip, members, me, admin, rsvps, notes, live, onTh
                <span className="muted">{going.length} in</span>
              </span>
            )}
-           <button type="button" className="chip border-brand/30 text-brand-dark"
-             onClick={async () => { await api.completeStop(item.id, true); onChange() }}>
-             ✓ Mark complete
+           <button
+             type="button"
+             aria-label={`Mark ${item.title} as completed`}
+             title="Mark as completed"
+             className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-line bg-white text-transparent transition hover:border-brand hover:bg-brand-wash hover:text-brand-dark focus:outline-none focus:ring-2 focus:ring-brand/20"
+             onClick={async () => { await api.completeStop(item.id, true); onChange() }}
+           >
+             ✓
            </button>
-           <button type="button" className="ml-auto text-[13px] font-medium text-brand hover:underline"
+           <button type="button" className="text-[13px] font-medium text-brand hover:underline"
              onClick={() => setShowNotes((v) => !v)}>
              {notes.length
                ? `${notes.length} suggestion${notes.length > 1 ? 's' : ''}${openVotes ? ` · ${openVotes} to vote on` : ''}`
