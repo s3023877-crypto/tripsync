@@ -2393,12 +2393,12 @@ function TripHeader({ trip, members }) {
            {[trip.destination, dateRange(trip.start_date, trip.end_date)].filter(Boolean).join(' · ')}
          </p>
        </div>
-       <div className="flex items-center gap-2">
+       <div className="flex items-center gap-3">
+         <AlertSettings trip={trip} compact />
          {phase === 'live' && <span className="chip border-signal/40 bg-signal-wash text-[#8A5B0E]">Happening now</span>}
          {phase === 'upcoming' && soon && <span className="chip chip-on">Starts {soon}</span>}
          {phase === 'past' && <span className="chip">Wrapped up</span>}
-         <AlertSettings trip={trip} compact />
-         <div className="ml-3 flex -space-x-1.5">
+         <div className="ml-2 flex -space-x-1.5">
            {members.slice(0, 6).map((m) => (
              <span key={m.id} className="rounded-full ring-2 ring-paper"><Avatar name={m.name} id={m.id} size="sm" /></span>
            ))}
@@ -3825,14 +3825,14 @@ function AlertSettings({ trip, compact = false }) {
          disabled={busy || status === 'denied' || status === 'unsupported'}
          onClick={pushOn ? turnOff : turnOn}
          className={cls(
-           'relative h-6 w-11 rounded-full transition-colors',
+           'relative inline-block h-6 w-11 shrink-0 rounded-full transition-colors',
            pushOn ? 'bg-brand' : 'bg-slate-300',
            (busy || status === 'denied' || status === 'unsupported') && 'cursor-not-allowed opacity-50'
          )}
        >
          <span
            className={cls(
-             'absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
+             'absolute left-0.5 top-0.5 block h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
              pushOn ? 'translate-x-5' : 'translate-x-0.5'
            )}
          />
